@@ -1,0 +1,1678 @@
+#!/usr/bin/env python3
+"""
+score_bark_events.py
+
+Given:
+- one source video
+- a full synchronized WAV
+- a bark timestamp CSV
+- tracks.csv from track_dogs.py
+- a saved vision-only ImageBind classifier
+
+For every bark event:
+1. find every stable dog ID with at least one real tracked box inside the
+   exact bark interval
+2. create a moving crop video for each candidate
+3. extract frozen ImageBind video embeddings
+4. score every candidate
+5. retain every candidate ID and score
+6. choose the highest score without rejecting low-confidence predictions
+7. write CSV outputs and an annotated MP4
+
+No-dog events are recorded as outside_or_offscreen.
+"""
+
+from __future__ import annotations
+
+import os
+
+import argparse
+import csv
+import json
+import math
+import shutil
+import subprocess
+import sys
+import time
+import traceback
+import wave
+from pathlib import Path
+from typing import Any
+
+import cv2
+import joblib
+import numpy as np
+import pandas as pd
+import torch
+
+
+DEFAULT_MODEL_DIR = Path(
+    os.environ.get(
+        "ACTIVE_BARKER_MODEL_DIR",
+        "/path/to/models_final",
+    )
+)
+
+DEFAULT_MODEL = (
+    DEFAULT_MODEL_DIR
+    / "vision_only_processed_plus_random1000_weight025_final.joblib"
+)
+
+TARGET_DURATION_SECONDS = 2.0
+DEFAULT_CROP_FPS = 10.0
+DEFAULT_WINDOW_STRIDE = 1.0
+DEFAULT_PADDING = 0.10
+DEFAULT_OUTPUT_SIZE = 224
+
+NORMAL_BOX_THICKNESS = 2
+WINNER_BOX_THICKNESS = 6
+FLASH_INTERVAL_FRAMES = 6
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+
+COLORS = [
+    (255, 0, 0),
+    (0, 255, 0),
+    (0, 0, 255),
+    (255, 255, 0),
+    (255, 0, 255),
+    (0, 255, 255),
+    (128, 0, 255),
+    (255, 128, 0),
+]
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Score every visible dog for every supplied bark event."
+    )
+    parser.add_argument("--video", type=Path, required=True)
+    parser.add_argument("--timestamps", type=Path, required=True)
+    parser.add_argument("--wav", type=Path, required=True)
+    parser.add_argument("--tracks", type=Path, required=True)
+    parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--crop-fps", type=float, default=DEFAULT_CROP_FPS)
+    parser.add_argument(
+        "--window-stride",
+        type=float,
+        default=DEFAULT_WINDOW_STRIDE,
+    )
+    parser.add_argument("--padding", type=float, default=DEFAULT_PADDING)
+    parser.add_argument("--output-size", type=int, default=DEFAULT_OUTPUT_SIZE)
+    parser.add_argument("--max-box-gap-sec", type=float, default=0.5)
+    parser.add_argument("--embedding-batch-size", type=int, default=8)
+    parser.add_argument(
+        "--skip-annotated-video",
+        action="store_true",
+    )
+    return parser.parse_args()
+
+
+def run_command(command: list[str]) -> None:
+    result = subprocess.run(
+        command,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            "Command failed:\n"
+            + " ".join(command)
+            + "\n\n"
+            + result.stderr[-4000:]
+        )
+
+
+def add_imagebind_root_to_path() -> None:
+    current = Path(__file__).resolve()
+    for parent in [current.parent, *current.parents]:
+        if (parent / "imagebind").is_dir():
+            text = str(parent)
+            if text not in sys.path:
+                sys.path.insert(0, text)
+            return
+
+
+def load_imagebind(device: str):
+    add_imagebind_root_to_path()
+    from imagebind.models import imagebind_model
+
+    model = imagebind_model.imagebind_huge(pretrained=True)
+    model.eval().to(device)
+    for parameter in model.parameters():
+        parameter.requires_grad = False
+    return model
+
+
+def embed_videos(
+    model,
+    paths: list[Path],
+    device: str,
+) -> np.ndarray:
+    add_imagebind_root_to_path()
+    from imagebind import data
+    from imagebind.models.imagebind_model import ModalityType
+
+    video_input = data.load_and_transform_video_data(
+        [str(path) for path in paths],
+        device,
+        clip_duration=int(TARGET_DURATION_SECONDS),
+        clips_per_video=1,
+    )
+
+    with torch.inference_mode():
+        output = model({ModalityType.VISION: video_input})
+
+    embeddings = (
+        output[ModalityType.VISION]
+        .detach()
+        .float()
+        .cpu()
+        .numpy()
+    )
+
+    embeddings = embeddings.reshape(len(paths), -1)
+
+    if embeddings.shape != (len(paths), 1024):
+        raise ValueError(
+            f"Unexpected ImageBind embedding shape: {embeddings.shape}"
+        )
+
+    if not np.isfinite(embeddings).all():
+        raise ValueError("ImageBind embeddings contain NaN or Inf.")
+
+    return embeddings
+
+
+def file_fingerprint(path: Path) -> dict[str, Any]:
+    stat = path.stat()
+    return {
+        "absolute_path": str(path.resolve()),
+        "size_bytes": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+    }
+
+
+def read_video_metadata(path: Path) -> dict[str, Any]:
+    capture = cv2.VideoCapture(str(path))
+    if not capture.isOpened():
+        raise RuntimeError(f"Could not open video: {path}")
+
+    fps = float(capture.get(cv2.CAP_PROP_FPS))
+    width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+    capture.release()
+
+    if fps <= 0 or width <= 0 or height <= 0 or frames <= 0:
+        raise RuntimeError(
+            f"Invalid video metadata: fps={fps}, width={width}, "
+            f"height={height}, frames={frames}"
+        )
+
+    return {
+        "fps": fps,
+        "width": width,
+        "height": height,
+        "frames": frames,
+        "duration_seconds": frames / fps,
+    }
+
+
+def wav_duration_seconds(path: Path) -> float:
+    # First try the standard WAV parser.
+    try:
+        with wave.open(str(path), "rb") as handle:
+            frames = handle.getnframes()
+            rate = handle.getframerate()
+            if rate > 0:
+                return frames / rate
+    except (wave.Error, EOFError):
+        pass
+
+    # Fall back to ffprobe for unusual WAV containers.
+    result = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Could not read WAV duration: {path}\n{result.stderr}"
+        )
+    return float(result.stdout.strip())
+
+
+def choose_column(
+    dataframe: pd.DataFrame,
+    candidates: list[str],
+    description: str,
+    required: bool = True,
+) -> str | None:
+    for name in candidates:
+        if name in dataframe.columns:
+            return name
+    if required:
+        raise KeyError(
+            f"Could not find {description}. Tried {candidates}. "
+            f"Available columns: {list(dataframe.columns)}"
+        )
+    return None
+
+
+def normalize_tracks(path: Path, video_fps: float) -> pd.DataFrame:
+    source = pd.read_csv(path)
+
+    required_output = [
+        "track_id",
+        "frame",
+        "time_sec",
+        "x1",
+        "y1",
+        "x2",
+        "y2",
+        "confidence",
+    ]
+
+    if source.empty:
+        return pd.DataFrame(columns=required_output)
+
+    track_col = choose_column(
+        source,
+        ["track_id", "track", "id"],
+        "track ID column",
+    )
+    frame_col = choose_column(
+        source,
+        ["frame", "frame_idx", "frame_id"],
+        "frame column",
+        required=False,
+    )
+    time_col = choose_column(
+        source,
+        ["time_sec", "timestamp_sec", "time"],
+        "time column",
+        required=False,
+    )
+
+    if frame_col is None and time_col is None:
+        raise KeyError(
+            "Track CSV needs a frame or time_sec column."
+        )
+
+    aliases = {
+        "x1": ["x1", "xtl", "left"],
+        "y1": ["y1", "ytl", "top"],
+        "x2": ["x2", "xbr", "right"],
+        "y2": ["y2", "ybr", "bottom"],
+    }
+
+    output = pd.DataFrame()
+    output["track_id"] = pd.to_numeric(
+        source[track_col],
+        errors="raise",
+    ).astype(int)
+
+    if frame_col is not None:
+        output["frame"] = pd.to_numeric(
+            source[frame_col],
+            errors="raise",
+        ).round().astype(int)
+        output["time_sec"] = output["frame"] / video_fps
+    else:
+        output["time_sec"] = pd.to_numeric(
+            source[time_col],
+            errors="raise",
+        ).astype(float)
+        output["frame"] = (
+            output["time_sec"] * video_fps
+        ).round().astype(int)
+
+    for canonical, candidates in aliases.items():
+        source_column = choose_column(
+            source,
+            candidates,
+            f"{canonical} bounding-box column",
+        )
+        output[canonical] = pd.to_numeric(
+            source[source_column],
+            errors="raise",
+        ).astype(float)
+
+    confidence_col = choose_column(
+        source,
+        ["confidence", "conf", "score"],
+        "confidence column",
+        required=False,
+    )
+    output["confidence"] = (
+        pd.to_numeric(source[confidence_col], errors="coerce")
+        if confidence_col is not None
+        else 0.0
+    )
+    output["confidence"] = output["confidence"].fillna(0.0).astype(float)
+
+    return (
+        output
+        .dropna()
+        .sort_values(["track_id", "frame"])
+        .drop_duplicates(["track_id", "frame"], keep="last")
+        .reset_index(drop=True)
+    )
+
+
+def normalize_events(
+    path: Path,
+    video_duration: float,
+) -> pd.DataFrame:
+    source = pd.read_csv(path)
+
+    if source.empty:
+        raise ValueError("Timestamp CSV contains no rows.")
+
+    start_col = choose_column(
+        source,
+        ["start_time", "start_time_sec", "start_sec", "start"],
+        "bark start-time column",
+    )
+    end_col = choose_column(
+        source,
+        ["end_time", "end_time_sec", "end_sec", "end"],
+        "bark end-time column",
+    )
+
+    explicit_id_col = choose_column(
+        source,
+        ["barkseq_id", "event_id", "bark_id"],
+        "event ID column",
+        required=False,
+    )
+    audio_file_col = choose_column(
+        source,
+        ["audio_file", "wav_file", "audio_path"],
+        "audio filename column",
+        required=False,
+    )
+
+    output = pd.DataFrame()
+    output["start_time_sec"] = pd.to_numeric(
+        source[start_col],
+        errors="raise",
+    ).astype(float)
+    output["end_time_sec"] = pd.to_numeric(
+        source[end_col],
+        errors="raise",
+    ).astype(float)
+
+    if explicit_id_col is not None:
+        base_ids = source[explicit_id_col].astype(str).tolist()
+    elif audio_file_col is not None:
+        base_ids = [
+            Path(str(value)).stem
+            for value in source[audio_file_col].tolist()
+        ]
+    else:
+        base_ids = [
+            f"bark_{index:03d}"
+            for index in range(len(source))
+        ]
+
+    seen: dict[str, int] = {}
+    unique_ids: list[str] = []
+
+    for index, raw_id in enumerate(base_ids):
+        cleaned = str(raw_id).strip() or f"bark_{index:03d}"
+        count = seen.get(cleaned, 0)
+        seen[cleaned] = count + 1
+        unique_ids.append(
+            cleaned if count == 0 else f"{cleaned}__{count + 1}"
+        )
+
+    output["event_id"] = unique_ids
+
+    for optional in [
+        "video_id",
+        "video_identifier",
+        "audio_file",
+        "audio_status",
+    ]:
+        output[optional] = (
+            source[optional].astype(str)
+            if optional in source.columns
+            else ""
+        )
+
+    invalid = (
+        ~np.isfinite(output["start_time_sec"])
+        | ~np.isfinite(output["end_time_sec"])
+        | (output["start_time_sec"] < 0)
+        | (
+            output["end_time_sec"]
+            <= output["start_time_sec"]
+        )
+    )
+    if invalid.any():
+        raise ValueError(
+            "Invalid timestamp rows:\n"
+            + output.loc[invalid].to_string(index=False)
+        )
+
+    too_late = output["start_time_sec"] >= video_duration
+    if too_late.any():
+        raise ValueError(
+            "Timestamp starts after the video ends:\n"
+            + output.loc[too_late].to_string(index=False)
+        )
+
+    # Permit tiny metadata rounding differences, but never score beyond video.
+    overrun = output["end_time_sec"] - video_duration
+    if (overrun > 0.25).any():
+        raise ValueError(
+            "Timestamp ends more than 0.25 seconds after the video:\n"
+            + output.loc[overrun > 0.25].to_string(index=False)
+        )
+
+    output["end_time_sec"] = output["end_time_sec"].clip(
+        upper=video_duration
+    )
+
+    return output[
+        [
+            "event_id",
+            "start_time_sec",
+            "end_time_sec",
+            "video_id",
+            "video_identifier",
+            "audio_file",
+            "audio_status",
+        ]
+    ]
+
+
+def estimate_tracking_fps(tracks: pd.DataFrame) -> float:
+    if tracks.empty:
+        return 10.0
+
+    unique_times = np.sort(
+        tracks["time_sec"].drop_duplicates().to_numpy(dtype=float)
+    )
+    differences = np.diff(unique_times)
+    differences = differences[differences > 1e-6]
+
+    if len(differences) == 0:
+        return 10.0
+
+    median_step = float(np.median(differences))
+    return 1.0 / median_step if median_step > 0 else 10.0
+
+
+def interpolate_box(
+    track_rows: pd.DataFrame,
+    target_frame: int,
+    max_gap_frames: int,
+) -> tuple[float, float, float, float] | None:
+    frames = track_rows["frame"].to_numpy(dtype=np.int64)
+    boxes = track_rows[
+        ["x1", "y1", "x2", "y2"]
+    ].to_numpy(dtype=np.float64)
+
+    if len(frames) == 0:
+        return None
+
+    position = int(np.searchsorted(frames, target_frame))
+    candidate_indices: list[int] = []
+
+    if position < len(frames):
+        candidate_indices.append(position)
+    if position > 0:
+        candidate_indices.append(position - 1)
+
+    if not candidate_indices:
+        return None
+
+    nearest_index = min(
+        candidate_indices,
+        key=lambda index: abs(int(frames[index]) - target_frame),
+    )
+
+    if abs(int(frames[nearest_index]) - target_frame) > max_gap_frames:
+        return None
+
+    if 0 < position < len(frames):
+        left_index = position - 1
+        right_index = position
+        left_frame = int(frames[left_index])
+        right_frame = int(frames[right_index])
+        gap = right_frame - left_frame
+
+        if (
+            left_frame <= target_frame <= right_frame
+            and gap > 0
+            and gap <= 2 * max_gap_frames
+        ):
+            alpha = (target_frame - left_frame) / gap
+            box = (
+                boxes[left_index] * (1.0 - alpha)
+                + boxes[right_index] * alpha
+            )
+            return tuple(float(value) for value in box)
+
+    return tuple(float(value) for value in boxes[nearest_index])
+
+
+def crop_and_letterbox(
+    frame: np.ndarray,
+    box: tuple[float, float, float, float],
+    padding_fraction: float,
+    output_size: int,
+) -> np.ndarray | None:
+    frame_height, frame_width = frame.shape[:2]
+    x1, y1, x2, y2 = box
+
+    if x2 <= x1 or y2 <= y1:
+        return None
+
+    box_width = x2 - x1
+    box_height = y2 - y1
+    pad_x = box_width * padding_fraction
+    pad_y = box_height * padding_fraction
+
+    x1 = max(0, int(math.floor(x1 - pad_x)))
+    y1 = max(0, int(math.floor(y1 - pad_y)))
+    x2 = min(frame_width, int(math.ceil(x2 + pad_x)))
+    y2 = min(frame_height, int(math.ceil(y2 + pad_y)))
+
+    if x2 - x1 < 2 or y2 - y1 < 2:
+        return None
+
+    crop = frame[y1:y2, x1:x2]
+    if crop.size == 0:
+        return None
+
+    crop_height, crop_width = crop.shape[:2]
+    scale = min(output_size / crop_width, output_size / crop_height)
+
+    resized_width = max(1, int(round(crop_width * scale)))
+    resized_height = max(1, int(round(crop_height * scale)))
+
+    resized = cv2.resize(
+        crop,
+        (resized_width, resized_height),
+        interpolation=cv2.INTER_LINEAR,
+    )
+
+    canvas = np.zeros(
+        (output_size, output_size, 3),
+        dtype=np.uint8,
+    )
+    offset_x = (output_size - resized_width) // 2
+    offset_y = (output_size - resized_height) // 2
+    canvas[
+        offset_y:offset_y + resized_height,
+        offset_x:offset_x + resized_width,
+    ] = resized
+
+    return canvas
+
+
+def read_frame(
+    capture: cv2.VideoCapture,
+    frame_index: int,
+    cache: dict[int, np.ndarray],
+) -> np.ndarray | None:
+    if frame_index in cache:
+        return cache[frame_index]
+
+    capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+    success, frame = capture.read()
+    if not success:
+        return None
+
+    cache[frame_index] = frame
+    return frame
+
+
+def make_window_starts(
+    event_start: float,
+    event_end: float,
+    stride: float,
+) -> list[float]:
+    duration = event_end - event_start
+
+    if duration <= TARGET_DURATION_SECONDS:
+        return [event_start]
+
+    final_start = event_end - TARGET_DURATION_SECONDS
+    starts = list(
+        np.arange(
+            event_start,
+            final_start + 1e-9,
+            stride,
+            dtype=float,
+        )
+    )
+    if not starts or abs(starts[-1] - final_start) > 1e-6:
+        starts.append(final_start)
+
+    return starts
+
+
+def source_frames_for_window(
+    window_start: float,
+    window_end: float,
+    video_fps: float,
+    crop_fps: float,
+    max_source_frame: int,
+) -> list[int]:
+    target_frame_count = int(
+        round(TARGET_DURATION_SECONDS * crop_fps)
+    )
+    actual_duration = max(0.0, window_end - window_start)
+    actual_frame_count = max(
+        1,
+        min(
+            target_frame_count,
+            int(math.ceil(actual_duration * crop_fps)),
+        ),
+    )
+
+    frame_indices = [
+        max(
+            0,
+            min(
+                max_source_frame,
+                int(round(
+                    (window_start + index / crop_fps)
+                    * video_fps
+                )),
+            ),
+        )
+        for index in range(actual_frame_count)
+    ]
+
+    while len(frame_indices) < target_frame_count:
+        frame_indices.append(frame_indices[-1])
+
+    return frame_indices[:target_frame_count]
+
+
+def create_track_clip(
+    *,
+    capture: cv2.VideoCapture,
+    frame_cache: dict[int, np.ndarray],
+    track_rows: pd.DataFrame,
+    source_frames: list[int],
+    output_path: Path,
+    crop_fps: float,
+    max_gap_frames: int,
+    padding_fraction: float,
+    output_size: int,
+) -> bool:
+    crops: list[np.ndarray | None] = []
+
+    for frame_index in source_frames:
+        frame = read_frame(capture, frame_index, frame_cache)
+        if frame is None:
+            crops.append(None)
+            continue
+
+        box = interpolate_box(
+            track_rows,
+            frame_index,
+            max_gap_frames,
+        )
+        if box is None:
+            crops.append(None)
+            continue
+
+        crops.append(
+            crop_and_letterbox(
+                frame,
+                box,
+                padding_fraction,
+                output_size,
+            )
+        )
+
+    valid_indices = [
+        index
+        for index, crop in enumerate(crops)
+        if crop is not None
+    ]
+    if not valid_indices:
+        return False
+
+    # Replace each missing crop by the closest valid crop in time.
+    for index, crop in enumerate(crops):
+        if crop is not None:
+            continue
+        nearest = min(
+            valid_indices,
+            key=lambda valid_index: abs(valid_index - index),
+        )
+        crops[index] = crops[nearest].copy()
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    writer = cv2.VideoWriter(
+        str(output_path),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        float(crop_fps),
+        (output_size, output_size),
+    )
+    if not writer.isOpened():
+        raise RuntimeError(f"Could not create crop video: {output_path}")
+
+    for crop in crops:
+        writer.write(np.ascontiguousarray(crop, dtype=np.uint8))
+
+    writer.release()
+    return True
+
+
+def color_for_track(track_id: int) -> tuple[int, int, int]:
+    return COLORS[int(track_id) % len(COLORS)]
+
+
+def draw_label(
+    frame: np.ndarray,
+    x1: int,
+    y1: int,
+    text: str,
+    color: tuple[int, int, int],
+) -> None:
+    font_scale = 0.52
+    thickness = 2
+    (text_width, text_height), baseline = cv2.getTextSize(
+        text,
+        FONT,
+        font_scale,
+        thickness,
+    )
+    top = max(0, y1 - text_height - baseline - 12)
+    left = max(0, x1)
+    right = min(frame.shape[1] - 1, left + text_width + 12)
+    bottom = min(frame.shape[0] - 1, top + text_height + baseline + 12)
+
+    cv2.rectangle(frame, (left, top), (right, bottom), color, -1)
+    cv2.putText(
+        frame,
+        text,
+        (left + 6, bottom - baseline - 5),
+        FONT,
+        font_scale,
+        (255, 255, 255),
+        thickness,
+        cv2.LINE_AA,
+    )
+
+
+def build_frame_event_map(
+    events: pd.DataFrame,
+    predictions: list[dict[str, Any]],
+    candidate_rows: list[dict[str, Any]],
+    fps: float,
+) -> dict[int, dict[str, Any]]:
+    prediction_by_id = {
+        str(row["event_id"]): row for row in predictions
+    }
+    scores_by_event: dict[str, dict[int, float]] = {}
+
+    for row in candidate_rows:
+        if row.get("status") != "scored":
+            continue
+        scores_by_event.setdefault(
+            str(row["event_id"]),
+            {},
+        )[int(row["track_id"])] = float(row["mean_score"])
+
+    frame_events: dict[int, dict[str, Any]] = {}
+
+    for _, event in events.iterrows():
+        event_id = str(event["event_id"])
+        prediction = prediction_by_id.get(event_id)
+        if prediction is None:
+            continue
+
+        start_frame = int(
+            math.floor(float(event["start_time_sec"]) * fps)
+        )
+        end_frame = int(
+            math.ceil(float(event["end_time_sec"]) * fps)
+        )
+
+        info = {
+            "event_id": event_id,
+            "status": prediction["status"],
+            "predicted_track_id": prediction.get("predicted_track_id"),
+            "top_score": prediction.get("top_score"),
+            "scores": scores_by_event.get(event_id, {}),
+        }
+
+        overlap_priority = (
+            float(prediction["top_score"])
+            if prediction.get("top_score") not in (None, "")
+            else -1.0
+        )
+
+        for frame_index in range(start_frame, end_frame + 1):
+            existing = frame_events.get(frame_index)
+            if existing is None or overlap_priority > existing["priority"]:
+                frame_events[frame_index] = {
+                    **info,
+                    "priority": overlap_priority,
+                }
+
+    return frame_events
+
+
+def render_annotated_video(
+    *,
+    video: Path,
+    wav: Path,
+    tracks: pd.DataFrame,
+    events: pd.DataFrame,
+    predictions: list[dict[str, Any]],
+    candidate_rows: list[dict[str, Any]],
+    output_path: Path,
+    max_box_gap_sec: float,
+) -> None:
+    info = read_video_metadata(video)
+    fps = float(info["fps"])
+    width = int(info["width"])
+    height = int(info["height"])
+
+    grouped_tracks = {
+        int(track_id): group.reset_index(drop=True)
+        for track_id, group in tracks.groupby("track_id")
+    }
+    max_gap_frames = max(
+        1,
+        int(round(max_box_gap_sec * fps)),
+    )
+    frame_events = build_frame_event_map(
+        events,
+        predictions,
+        candidate_rows,
+        fps,
+    )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    silent_path = output_path.with_name(
+        output_path.stem + ".silent_tmp.mp4"
+    )
+
+    capture = cv2.VideoCapture(str(video))
+    if not capture.isOpened():
+        raise RuntimeError(f"Could not open video: {video}")
+
+    writer = cv2.VideoWriter(
+        str(silent_path),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        fps,
+        (width, height),
+    )
+    if not writer.isOpened():
+        capture.release()
+        raise RuntimeError(f"Could not create: {silent_path}")
+
+    frame_index = 0
+
+    try:
+        while True:
+            success, frame = capture.read()
+            if not success:
+                break
+
+            bark_info = frame_events.get(frame_index)
+
+            for track_id, track_rows in grouped_tracks.items():
+                box = interpolate_box(
+                    track_rows,
+                    frame_index,
+                    max_gap_frames,
+                )
+                if box is None:
+                    continue
+
+                x1, y1, x2, y2 = [
+                    int(round(value)) for value in box
+                ]
+                x1 = max(0, min(width - 1, x1))
+                y1 = max(0, min(height - 1, y1))
+                x2 = max(0, min(width - 1, x2))
+                y2 = max(0, min(height - 1, y2))
+
+                color = color_for_track(track_id)
+                score = None
+                is_winner = False
+
+                if bark_info is not None:
+                    score = bark_info["scores"].get(track_id)
+                    predicted = bark_info.get("predicted_track_id")
+                    is_winner = (
+                        predicted not in (None, "")
+                        and int(predicted) == track_id
+                    )
+
+                if is_winner:
+                    flash_on = (
+                        frame_index // FLASH_INTERVAL_FRAMES
+                    ) % 2 == 0
+                    thickness = (
+                        WINNER_BOX_THICKNESS
+                        if flash_on
+                        else NORMAL_BOX_THICKNESS
+                    )
+                else:
+                    thickness = NORMAL_BOX_THICKNESS
+
+                if is_winner:
+                    if score is not None:
+                        label = f"BARKING | dog #{track_id} | {score:.3f}"
+                    else:
+                        label = f"BARKING | dog #{track_id}"
+                elif score is not None:
+                    label = f"dog #{track_id} | {score:.3f}"
+                else:
+                    label = f"dog #{track_id}"
+
+                cv2.rectangle(
+                    frame,
+                    (x1, y1),
+                    (x2, y2),
+                    color,
+                    thickness,
+                )
+                draw_label(frame, x1, y1, label, color)
+
+            writer.write(np.ascontiguousarray(frame, dtype=np.uint8))
+            frame_index += 1
+    finally:
+        capture.release()
+        writer.release()
+
+    run_command(
+        [
+            "ffmpeg",
+            "-y",
+            "-v",
+            "error",
+            "-i",
+            str(silent_path),
+            "-i",
+            str(wav),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "libx264",
+            "-c:a",
+            "aac",
+            "-shortest",
+            "-crf",
+            "23",
+            str(output_path),
+        ]
+    )
+    silent_path.unlink(missing_ok=True)
+
+
+def write_csv(
+    path: Path,
+    rows: list[dict[str, Any]],
+    fieldnames: list[str],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=fieldnames,
+            extrasaction="ignore",
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+    temporary.replace(path)
+
+
+def main() -> None:
+    args = parse_args()
+
+    video = args.video.expanduser().resolve()
+    timestamps_path = args.timestamps.expanduser().resolve()
+    wav = args.wav.expanduser().resolve()
+    tracks_path = args.tracks.expanduser().resolve()
+    model_path = args.model.expanduser().resolve()
+    output_dir = args.output_dir.expanduser().resolve()
+
+    for path in [
+        video,
+        timestamps_path,
+        wav,
+        tracks_path,
+        model_path,
+    ]:
+        if not path.is_file():
+            raise FileNotFoundError(path)
+
+    if str(args.device).startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested, but CUDA is unavailable.")
+
+    if args.crop_fps <= 0:
+        raise ValueError("--crop-fps must be positive.")
+    if args.window_stride <= 0:
+        raise ValueError("--window-stride must be positive.")
+    if args.embedding_batch_size <= 0:
+        raise ValueError("--embedding-batch-size must be positive.")
+    if args.output_size <= 0:
+        raise ValueError("--output-size must be positive.")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    crops_root = output_dir / "crops"
+
+    # Scoring outputs are replaced on every run to avoid stale candidates.
+    if crops_root.exists():
+        shutil.rmtree(crops_root)
+    crops_root.mkdir(parents=True, exist_ok=True)
+
+    video_info = read_video_metadata(video)
+    tracks = normalize_tracks(tracks_path, float(video_info["fps"]))
+    events = normalize_events(
+        timestamps_path,
+        float(video_info["duration_seconds"]),
+    )
+
+    audio_duration = wav_duration_seconds(wav)
+    last_event_end = float(events["end_time_sec"].max())
+    if audio_duration + 0.05 < last_event_end:
+        raise ValueError(
+            f"WAV ends at {audio_duration:.3f}s, but the final bark "
+            f"timestamp ends at {last_event_end:.3f}s."
+        )
+
+    bundle = joblib.load(model_path)
+    if not isinstance(bundle, dict) or "model" not in bundle:
+        raise ValueError(
+            "Expected a joblib bundle containing a 'model' field."
+        )
+
+    feature_kind = bundle.get("feature_kind")
+    if feature_kind != "vision_only":
+        raise ValueError(
+            "This pipeline currently expects a vision_only model. "
+            f"Received feature_kind={feature_kind!r}."
+        )
+
+    expected_dimensions = int(
+        bundle.get("feature_dimensions", 1024)
+    )
+    if expected_dimensions != 1024:
+        raise ValueError(
+            f"Expected a 1024-dimensional vision model, got "
+            f"{expected_dimensions}."
+        )
+
+    classifier = bundle["model"]
+
+    # Compatibility fix for a LogisticRegression model serialized with a
+    # newer scikit-learn version. Older versions expect this attribute during
+    # predict_proba(), but it may be absent after unpickling.
+    try:
+        final_estimator = classifier.steps[-1][1]
+    except (AttributeError, IndexError, TypeError):
+        final_estimator = classifier
+
+    if (
+        final_estimator.__class__.__name__ == "LogisticRegression"
+        and not hasattr(final_estimator, "multi_class")
+    ):
+        final_estimator.multi_class = "auto"
+        print(
+            "Applied scikit-learn compatibility fix: "
+            "LogisticRegression.multi_class='auto'"
+        )
+
+    tracking_fps = estimate_tracking_fps(tracks)
+    max_gap_frames = max(
+        1,
+        int(round(args.max_box_gap_sec * video_info["fps"])),
+    )
+
+    print("=" * 78)
+    print("BARK-EVENT SCORING")
+    print("=" * 78)
+    print("Video:", video)
+    print("Timestamps:", timestamps_path)
+    print("Full WAV:", wav)
+    print("Tracks:", tracks_path)
+    print("Model:", model_path)
+    print("Events:", len(events))
+    print("Track rows:", len(tracks))
+    print("Unique tracks:", tracks["track_id"].nunique() if len(tracks) else 0)
+    print("Estimated tracking FPS:", tracking_fps)
+    print("Device:", args.device)
+    print()
+    print("Loading frozen ImageBind...")
+    imagebind = load_imagebind(args.device)
+
+    capture = cv2.VideoCapture(str(video))
+    if not capture.isOpened():
+        raise RuntimeError(f"Could not open video: {video}")
+
+    started = time.perf_counter()
+    prediction_rows: list[dict[str, Any]] = []
+    candidate_rows: list[dict[str, Any]] = []
+
+    try:
+        for event_number, (_, event) in enumerate(
+            events.iterrows(),
+            start=1,
+        ):
+            event_id = str(event["event_id"])
+            event_start = float(event["start_time_sec"])
+            event_end = float(event["end_time_sec"])
+            duration = event_end - event_start
+
+            print("-" * 78)
+            print(
+                f"[{event_number}/{len(events)}] {event_id}: "
+                f"{event_start:.3f}s to {event_end:.3f}s"
+            )
+
+            exact_event_rows = tracks[
+                (tracks["time_sec"] >= event_start - 1e-9)
+                & (tracks["time_sec"] <= event_end + 1e-9)
+            ]
+            candidate_track_ids = sorted(
+                exact_event_rows["track_id"].unique().tolist()
+            )
+
+            common_prediction = {
+                "event_id": event_id,
+                "video_id": str(event["video_id"]),
+                "video_identifier": str(event["video_identifier"]),
+                "start_time_sec": event_start,
+                "end_time_sec": event_end,
+                "duration_sec": duration,
+                "audio_file": str(event["audio_file"]),
+                "audio_status": str(event["audio_status"]),
+            }
+
+            if not candidate_track_ids:
+                print("No dog was tracked inside the exact bark interval.")
+                prediction_rows.append(
+                    {
+                        **common_prediction,
+                        "status": "outside_or_offscreen",
+                        "num_candidates": 0,
+                        "predicted_track_id": "",
+                        "top_score": "",
+                        "second_score": "",
+                        "margin": "",
+                        "all_candidate_ids": "[]",
+                        "all_scores": "{}",
+                        "error": "",
+                    }
+                )
+                continue
+
+            print("Candidate stable IDs:", candidate_track_ids)
+
+            try:
+                window_starts = make_window_starts(
+                    event_start,
+                    event_end,
+                    args.window_stride,
+                )
+                frame_cache: dict[int, np.ndarray] = {}
+                clips_to_embed: list[dict[str, Any]] = []
+
+                for track_id in candidate_track_ids:
+                    track_rows = tracks[
+                        tracks["track_id"] == track_id
+                    ].reset_index(drop=True)
+
+                    for window_index, window_start in enumerate(window_starts):
+                        window_end = min(
+                            event_end,
+                            window_start + TARGET_DURATION_SECONDS,
+                        )
+
+                        # Do not score a window where this track has no real
+                        # tracked box inside that window.
+                        real_window_rows = track_rows[
+                            (track_rows["time_sec"] >= window_start - 1e-9)
+                            & (track_rows["time_sec"] <= window_end + 1e-9)
+                        ]
+                        if real_window_rows.empty:
+                            continue
+
+                        source_frames = source_frames_for_window(
+                            window_start,
+                            window_end,
+                            float(video_info["fps"]),
+                            args.crop_fps,
+                            int(video_info["frames"]) - 1,
+                        )
+
+                        event_crop_dir = crops_root / event_id
+                        if len(window_starts) == 1:
+                            clip_path = (
+                                event_crop_dir
+                                / f"track_{track_id}.mp4"
+                            )
+                        else:
+                            clip_path = (
+                                event_crop_dir
+                                / (
+                                    f"track_{track_id}"
+                                    f"_window_{window_index:03d}.mp4"
+                                )
+                            )
+
+                        created = create_track_clip(
+                            capture=capture,
+                            frame_cache=frame_cache,
+                            track_rows=track_rows,
+                            source_frames=source_frames,
+                            output_path=clip_path,
+                            crop_fps=args.crop_fps,
+                            max_gap_frames=max_gap_frames,
+                            padding_fraction=args.padding,
+                            output_size=args.output_size,
+                        )
+                        if not created:
+                            raise RuntimeError(
+                                f"Could not create a valid crop for "
+                                f"event={event_id}, track={track_id}, "
+                                f"window={window_index}."
+                            )
+
+                        clips_to_embed.append(
+                            {
+                                "track_id": int(track_id),
+                                "window_index": int(window_index),
+                                "window_start_sec": float(window_start),
+                                "window_end_sec": float(window_end),
+                                "path": clip_path,
+                            }
+                        )
+
+                if not clips_to_embed:
+                    raise RuntimeError(
+                        "Candidate IDs existed, but no candidate crop "
+                        "could be generated."
+                    )
+
+                for batch_start in range(
+                    0,
+                    len(clips_to_embed),
+                    args.embedding_batch_size,
+                ):
+                    batch_items = clips_to_embed[
+                        batch_start:
+                        batch_start + args.embedding_batch_size
+                    ]
+                    embeddings = embed_videos(
+                        imagebind,
+                        [item["path"] for item in batch_items],
+                        args.device,
+                    )
+                    probabilities = classifier.predict_proba(
+                        embeddings
+                    )[:, 1]
+
+                    for item, probability in zip(
+                        batch_items,
+                        probabilities,
+                    ):
+                        item["score"] = float(probability)
+
+                by_track: dict[int, list[dict[str, Any]]] = {}
+                for item in clips_to_embed:
+                    by_track.setdefault(
+                        int(item["track_id"]),
+                        [],
+                    ).append(item)
+
+                track_summaries: list[dict[str, Any]] = []
+
+                for track_id in candidate_track_ids:
+                    items = by_track.get(int(track_id), [])
+                    if not items:
+                        raise RuntimeError(
+                            f"Track {track_id} had no scored windows."
+                        )
+
+                    scores = [float(item["score"]) for item in items]
+                    mean_score = float(np.mean(scores))
+                    max_score = float(np.max(scores))
+
+                    event_track_rows = exact_event_rows[
+                        exact_event_rows["track_id"] == track_id
+                    ]
+                    visible_frames = int(
+                        event_track_rows["frame"].nunique()
+                    )
+                    expected_frames = max(
+                        1,
+                        int(math.ceil(duration * tracking_fps)),
+                    )
+                    visible_fraction = min(
+                        1.0,
+                        visible_frames / expected_frames,
+                    )
+
+                    track_summaries.append(
+                        {
+                            "track_id": int(track_id),
+                            "mean_score": mean_score,
+                            "max_score": max_score,
+                            "window_scores": scores,
+                            "window_starts": [
+                                float(item["window_start_sec"])
+                                for item in items
+                            ],
+                            "crop_paths": [
+                                str(
+                                    item["path"].relative_to(output_dir)
+                                )
+                                for item in items
+                            ],
+                            "visible_frames": visible_frames,
+                            "expected_frames": expected_frames,
+                            "visible_fraction": visible_fraction,
+                        }
+                    )
+
+                ranking = sorted(
+                    track_summaries,
+                    key=lambda row: row["mean_score"],
+                    reverse=True,
+                )
+
+                for rank, summary in enumerate(ranking, start=1):
+                    candidate_rows.append(
+                        {
+                            **common_prediction,
+                            "track_id": summary["track_id"],
+                            "rank": rank,
+                            "status": "scored",
+                            "mean_score": summary["mean_score"],
+                            "max_score": summary["max_score"],
+                            "window_count": len(
+                                summary["window_scores"]
+                            ),
+                            "window_scores": json.dumps(
+                                [
+                                    round(value, 8)
+                                    for value in summary[
+                                        "window_scores"
+                                    ]
+                                ]
+                            ),
+                            "window_starts_sec": json.dumps(
+                                summary["window_starts"]
+                            ),
+                            "crop_paths": json.dumps(
+                                summary["crop_paths"]
+                            ),
+                            "visible_frames": summary[
+                                "visible_frames"
+                            ],
+                            "expected_frames": summary[
+                                "expected_frames"
+                            ],
+                            "visible_fraction": summary[
+                                "visible_fraction"
+                            ],
+                            "error": "",
+                        }
+                    )
+
+                winner = ranking[0]
+                second_score = (
+                    float(ranking[1]["mean_score"])
+                    if len(ranking) > 1
+                    else None
+                )
+                margin = (
+                    float(winner["mean_score"] - second_score)
+                    if second_score is not None
+                    else None
+                )
+
+                prediction_rows.append(
+                    {
+                        **common_prediction,
+                        "status": "predicted",
+                        "num_candidates": len(ranking),
+                        "predicted_track_id": int(
+                            winner["track_id"]
+                        ),
+                        "top_score": float(
+                            winner["mean_score"]
+                        ),
+                        "second_score": (
+                            second_score
+                            if second_score is not None
+                            else ""
+                        ),
+                        "margin": (
+                            margin if margin is not None else ""
+                        ),
+                        "all_candidate_ids": json.dumps(
+                            [
+                                int(row["track_id"])
+                                for row in ranking
+                            ]
+                        ),
+                        "all_scores": json.dumps(
+                            {
+                                str(row["track_id"]): round(
+                                    float(row["mean_score"]),
+                                    8,
+                                )
+                                for row in ranking
+                            },
+                            sort_keys=True,
+                        ),
+                        "error": "",
+                    }
+                )
+
+                print("Ranking:")
+                for rank, row in enumerate(ranking, start=1):
+                    print(
+                        f"  {rank}. track {row['track_id']}: "
+                        f"mean={row['mean_score']:.6f}, "
+                        f"max={row['max_score']:.6f}, "
+                        f"visible={row['visible_fraction']:.3f}"
+                    )
+                print(
+                    f"Prediction: track {winner['track_id']} "
+                    f"(score={winner['mean_score']:.6f})"
+                )
+
+            except Exception as error:
+                print("SCORING FAILED:", error)
+                prediction_rows.append(
+                    {
+                        **common_prediction,
+                        "status": "scoring_failed",
+                        "num_candidates": len(candidate_track_ids),
+                        "predicted_track_id": "",
+                        "top_score": "",
+                        "second_score": "",
+                        "margin": "",
+                        "all_candidate_ids": json.dumps(
+                            [int(value) for value in candidate_track_ids]
+                        ),
+                        "all_scores": "{}",
+                        "error": (
+                            f"{type(error).__name__}: {error}"
+                        ),
+                    }
+                )
+                traceback.print_exc()
+                continue
+    finally:
+        capture.release()
+
+    prediction_fields = [
+        "event_id",
+        "video_id",
+        "video_identifier",
+        "start_time_sec",
+        "end_time_sec",
+        "duration_sec",
+        "audio_file",
+        "audio_status",
+        "status",
+        "num_candidates",
+        "predicted_track_id",
+        "top_score",
+        "second_score",
+        "margin",
+        "all_candidate_ids",
+        "all_scores",
+        "error",
+    ]
+    candidate_fields = [
+        "event_id",
+        "video_id",
+        "video_identifier",
+        "start_time_sec",
+        "end_time_sec",
+        "duration_sec",
+        "audio_file",
+        "audio_status",
+        "track_id",
+        "rank",
+        "status",
+        "mean_score",
+        "max_score",
+        "window_count",
+        "window_scores",
+        "window_starts_sec",
+        "crop_paths",
+        "visible_frames",
+        "expected_frames",
+        "visible_fraction",
+        "error",
+    ]
+
+    predictions_path = output_dir / "predictions.csv"
+    candidates_path = output_dir / "candidate_scores.csv"
+    write_csv(predictions_path, prediction_rows, prediction_fields)
+    write_csv(candidates_path, candidate_rows, candidate_fields)
+
+    annotated_path = output_dir / "annotated_predictions.mp4"
+    if not args.skip_annotated_video:
+        print()
+        print("Rendering annotated video...")
+        render_annotated_video(
+            video=video,
+            wav=wav,
+            tracks=tracks,
+            events=events,
+            predictions=prediction_rows,
+            candidate_rows=candidate_rows,
+            output_path=annotated_path,
+            max_box_gap_sec=args.max_box_gap_sec,
+        )
+
+    elapsed = time.perf_counter() - started
+    metadata = {
+        "status": "complete",
+        "video": file_fingerprint(video),
+        "timestamps": file_fingerprint(timestamps_path),
+        "wav": file_fingerprint(wav),
+        "wav_duration_seconds": float(audio_duration),
+        "tracks": file_fingerprint(tracks_path),
+        "model": file_fingerprint(model_path),
+        "feature_kind": feature_kind,
+        "events_total": int(len(events)),
+        "events_predicted": int(
+            sum(row["status"] == "predicted" for row in prediction_rows)
+        ),
+        "events_outside_or_offscreen": int(
+            sum(
+                row["status"] == "outside_or_offscreen"
+                for row in prediction_rows
+            )
+        ),
+        "events_scoring_failed": int(
+            sum(
+                row["status"] == "scoring_failed"
+                for row in prediction_rows
+            )
+        ),
+        "candidate_rows": int(len(candidate_rows)),
+        "tracking_fps_estimate": float(tracking_fps),
+        "parameters": {
+            "target_duration_seconds": TARGET_DURATION_SECONDS,
+            "crop_fps": float(args.crop_fps),
+            "window_stride": float(args.window_stride),
+            "padding": float(args.padding),
+            "output_size": int(args.output_size),
+            "max_box_gap_sec": float(args.max_box_gap_sec),
+            "embedding_batch_size": int(
+                args.embedding_batch_size
+            ),
+            "selection_rule": (
+                "highest mean model score; never reject for low "
+                "confidence or small margin"
+            ),
+            "candidate_rule": (
+                "at least one real tracked box inside exact bark interval"
+            ),
+        },
+        "outputs": {
+            "predictions_csv": str(predictions_path),
+            "candidate_scores_csv": str(candidates_path),
+            "crops_root": str(crops_root),
+            "annotated_video": (
+                str(annotated_path)
+                if not args.skip_annotated_video
+                else None
+            ),
+        },
+        "elapsed_seconds": float(elapsed),
+    }
+
+    scoring_metadata = output_dir / "scoring_metadata.json"
+    temporary_metadata = scoring_metadata.with_suffix(".json.tmp")
+    temporary_metadata.write_text(
+        json.dumps(metadata, indent=2),
+        encoding="utf-8",
+    )
+    temporary_metadata.replace(scoring_metadata)
+
+    print()
+    print("=" * 78)
+    print("SCORING COMPLETE")
+    print("=" * 78)
+    print("Predictions:", predictions_path)
+    print("Candidate scores:", candidates_path)
+    print("Crops:", crops_root)
+    if not args.skip_annotated_video:
+        print("Annotated video:", annotated_path)
+    print("Metadata:", scoring_metadata)
+    print("Elapsed minutes:", round(elapsed / 60.0, 2))
+
+
+if __name__ == "__main__":
+    main()

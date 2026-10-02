@@ -1,0 +1,33 @@
+# ------------------------------------------------------------------
+# Core numeric / IO stack
+# ------------------------------------------------------------------
+numpy>=1.24
+pandas>=2.0
+scipy>=1.10
+opencv-python>=4.8
+
+# ------------------------------------------------------------------
+# Deep learning stack
+# ------------------------------------------------------------------
+# CPU-only install (works everywhere, slow):
+#   pip install -r requirements.txt
+# GPU install (recommended for real runs): install the CUDA build of
+# torch/torchvision FIRST from https://pytorch.org/get-started/locally/
+# for your CUDA version, e.g.:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# then run `pip install -r requirements.txt` and pip will see torch is
+# already satisfied and skip it.
+torch>=2.1
+torchvision>=0.16
+
+# RT-DETR detector (Ultralytics)
+ultralytics>=8.1,<9.0
+
+# OSNet re-identification / appearance embeddings
+torchreid>=0.2.5
+
+# ------------------------------------------------------------------
+# Evaluation
+# ------------------------------------------------------------------
+# TrackEval (HOTA / CLEAR / Identity metrics), used by run_mot_eval.py
+trackeval>=1.0.1
