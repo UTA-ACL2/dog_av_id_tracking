@@ -1,6 +1,8 @@
 # Multimodal Dog Fingerprinting Pipeline
 
-This repository contains the final multimodal pipeline developed for our AAAI Dog Fingerprinting project. The pipeline combines visual tracking and canine vocal fingerprinting to identify individual dogs in unconstrained videos, maintain persistent identities across the video, and associate barking events with the correct dog.
+This repository accompanies the paper "Audio-Visual Dog Identification and Tracking in Real-World Videos".
+
+The pipeline combines visual tracking and canine vocal fingerprinting to identify individual dogs in unconstrained videos, maintain persistent identities across the video, and associate barking events with the correct dog.
 
 Unlike traditional tracking pipelines, this system is designed specifically for unconstrained YouTube videos where dogs may become occluded, leave and re-enter the camera, multiple dogs may bark simultaneously, and videos often contain intro/outro graphics that resemble real dogs.
 
